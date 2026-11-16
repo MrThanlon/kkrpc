@@ -91,24 +91,28 @@ export type Remote<T> = T extends Builtin
 		? T extends (...args: infer FA) => infer FR
 			? ((...args: FA) => PromisifyReturn<FR>) & (new (...args: CA) => Promise<RemoteValue<CR>>)
 			: new (...args: CA) => Promise<RemoteValue<CR>>
-		: T extends (...args: infer FA) => infer FR
-			? (...args: FA) => PromisifyReturn<FR>
-			: T extends object
-				? {
-						readonly [K in keyof T]: T[K] extends Builtin
-							? RemoteProperty<T[K]>
-							: T[K] extends new (...args: infer CA) => infer CR
-								? T[K] extends (...args: infer FA) => infer FR
-									? ((...args: FA) => PromisifyReturn<FR>) &
-											(new (...args: CA) => Promise<RemoteValue<CR>>)
-									: new (...args: CA) => Promise<RemoteValue<CR>>
-								: T[K] extends (...args: infer FA) => infer FR
-									? (...args: FA) => PromisifyReturn<FR>
-									: T[K] extends object
-										? Remote<T[K]>
-										: RemoteProperty<T[K]>
-					}
-				: RemoteProperty<T>
+		: T extends (...args: any[]) => Promise<any>
+			? T
+			: T extends (...args: infer FA) => infer FR
+				? (...args: FA) => PromisifyReturn<FR>
+				: T extends object
+					? {
+							readonly [K in keyof T]: T[K] extends Builtin
+								? RemoteProperty<T[K]>
+								: T[K] extends new (...args: infer CA) => infer CR
+									? T[K] extends (...args: infer FA) => infer FR
+										? ((...args: FA) => PromisifyReturn<FR>) &
+												(new (...args: CA) => Promise<RemoteValue<CR>>)
+										: new (...args: CA) => Promise<RemoteValue<CR>>
+									: T[K] extends (...args: any[]) => Promise<any>
+										? T[K]
+										: T[K] extends (...args: infer FA) => infer FR
+											? (...args: FA) => PromisifyReturn<FR>
+											: T[K] extends object
+												? Remote<T[K]>
+												: RemoteProperty<T[K]>
+						}
+					: RemoteProperty<T>
 
 /**
  * Error branding type emitted when a callback in a one-way exposed API violates the `void` return constraint.

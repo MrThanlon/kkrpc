@@ -305,4 +305,21 @@ describe("Runtime integration with Remote<T> and expose constraints", () => {
 		client.destroy()
 		server.destroy()
 	})
+
+	test("generic dispatch", async () => {
+		type G = {
+			foo: (n: number) => void
+			bar: (s: string) => void
+		}
+		type API = {
+			on: <E extends keyof G>(e: E, handler: G[E]) => Promise<void>
+		}
+		type RemoteAPI = Remote<API>
+		const api = {} as API
+		const remote = {} as RemoteAPI
+		type OnFoo = typeof api.on<"foo">
+		type RemoteOnFoo = typeof remote.on<"foo">
+		type _testAPIFoo = Expect<Equal<Parameters<Parameters<OnFoo>[1]>[0], number>>
+		type _testRemoteFoo = Expect<Equal<Parameters<Parameters<RemoteOnFoo>[1]>[0], number>>
+	})
 })
