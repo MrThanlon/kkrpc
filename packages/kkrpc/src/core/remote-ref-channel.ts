@@ -134,10 +134,14 @@ export class RemoteReferenceRPCChannel<
 	private localRefs = new Map<string, LocalRefRecord>()
 	private releasedLocalRefIdOrder: string[] = []
 	private releasedLocalRefIds = new Set<string>()
-	private remoteProxyRecords = new Set<RemoteProxyRecord>()
+	private activeRemoteProxyRecords = new WeakSet<RemoteProxyRecord>()
 	private readonly remoteProxyOwner = Symbol("kkrpc.remote-ref-channel")
 	private supportsRemoteRefs: boolean
 	private readonly autoProxy: boolean
+	private refRegistry: FinalizationRegistry<string>
+	private remoteProxyFacades: Map<string, WeakRef<object>>
+	private pendingRefReleases = new Set<string>()
+	private refReleaseScheduled = false
 
 	constructor(
 		transport: Transport<RPCMessage>,
@@ -147,19 +151,44 @@ export class RemoteReferenceRPCChannel<
 		this.supportsRemoteRefs =
 			options.remoteRefs !== false && transport.capabilities?.remoteRefs === true
 		this.autoProxy = options.autoProxy ?? true
+
+		this.remoteProxyFacades = new Map()
+		this.refRegistry = new FinalizationRegistry((id: string) => {
+			if (this.destroyed || this.closed) return
+			if (this.remoteProxyFacades.get(id)?.deref() !== undefined) return
+			this.remoteProxyFacades.delete(id)
+			this.queueRefRelease(id)
+		})
 	}
 
 	/** Release local bookkeeping and mark decoded remote proxies as unusable. */
 	override destroy(): void {
 		if (this.destroyed) return
-		for (const record of this.remoteProxyRecords) record.markReleased()
-		this.remoteProxyRecords.clear()
 		this.localRefIds = new WeakMap()
 		this.localReceiverRefIds = new WeakMap()
 		this.localRefs.clear()
 		this.releasedLocalRefIdOrder.length = 0
 		this.releasedLocalRefIds.clear()
+		this.remoteProxyFacades.clear()
+		this.pendingRefReleases.clear()
 		super.destroy()
+	}
+
+	/** Queue a remote reference id for release notification to its owner. */
+	private queueRefRelease(id: string): void {
+		if (this.destroyed || this.closed) return
+		this.pendingRefReleases.add(id)
+		if (this.refReleaseScheduled) return
+		this.refReleaseScheduled = true
+		queueMicrotask(() => {
+			this.refReleaseScheduled = false
+			if (this.destroyed || this.closed || this.pendingRefReleases.size === 0) return
+			const ids = [...this.pendingRefReleases]
+			this.pendingRefReleases.clear()
+			for (const refId of ids) {
+				void this.request("ref", [refId, "release"]).catch(() => {})
+			}
+		})
 	}
 
 	/** Route internal `op: "ref"` messages before normal exposed-API dispatch. */
@@ -205,28 +234,29 @@ export class RemoteReferenceRPCChannel<
 		}
 	}
 
-	/** Encode outbound requests and roll back newly retained refs if the send fails. */
-	protected override request(
+	/**
+	 * Send an RPC request, encoding arguments and retainable explicit proxy references.
+	 *
+	 * Retained references are committed only if `this.post()` succeeds. If sending
+	 * fails synchronously or rejects before the message reaches the transport, any
+	 * local reference created in this pass is rolled back.
+	 */
+	override request(
 		op: RPCRequest["op"],
 		path: string[],
 		args?: unknown[],
 		value: unknown = NO_VALUE,
-		callOptions?: CallOptions
+		callOptions?: CallOptions,
+		meta?: RPCMessageMetadata
 	): Promise<unknown> {
 		if (this.destroyed) return Promise.reject(new Error("RPC channel destroyed"))
-		if (this.closed) return Promise.reject(new RPCTransportClosedError(this.closeReason))
-		if (callOptions?.signal?.aborted) return Promise.reject(toAbortError(callOptions.signal))
-		let meta: RPCMessageMetadata | undefined
-		try {
-			meta = this.getMetadata?.()
-		} catch (error) {
-			return Promise.reject(error instanceof Error ? error : new Error(String(error)))
-		}
+		if (this.closed) return Promise.reject(new RPCTransportClosedError())
 
 		const id = generateId()
-		const transfers: Transferable[] = []
 		const message: RPCRequest = { t: "q", id, op, p: path }
+		const transfers: Transferable[] = []
 		const retainedRefs = this.createRewriteState()
+
 		try {
 			if (args) message.a = this.encodeArgs(args, transfers, retainedRefs)
 			if (value !== NO_VALUE) message.v = this.encodeRoot(value, transfers, retainedRefs)
@@ -637,6 +667,11 @@ export class RemoteReferenceRPCChannel<
 
 	/** Create a callable proxy that forwards invocation to the remote owner. */
 	private createRemoteFunction(ref: RemoteRefEnvelope): (...args: unknown[]) => Promise<unknown> {
+		const existing = this.remoteProxyFacades.get(ref.id)?.deref()
+		if (existing && typeof existing === "function") {
+			return existing as (...args: unknown[]) => Promise<unknown>
+		}
+
 		let released = false
 		const remoteFunction = (...args: unknown[]) => {
 			if (released) return Promise.reject(new RPCRemoteReferenceReleasedError(ref.id))
@@ -650,19 +685,42 @@ export class RemoteReferenceRPCChannel<
 				return released
 			},
 			release: async () => {
-				await this.request("ref", [ref.id, "release"])
-			},
-			markReleased() {
+				if (released) return
 				released = true
+				this.activeRemoteProxyRecords.delete(record)
+				this.refRegistry.unregister(remoteFunction)
+				if (this.remoteProxyFacades?.get(ref.id)?.deref() === remoteFunction) {
+					this.remoteProxyFacades.delete(ref.id)
+				}
+				await this.request("ref", [ref.id, "release"]).catch(() => {})
+			},
+			markReleased: () => {
+				if (released) return
+				released = true
+				this.activeRemoteProxyRecords.delete(record)
+				this.refRegistry.unregister(remoteFunction)
+				if (this.remoteProxyFacades.get(ref.id)?.deref() === remoteFunction) {
+					this.remoteProxyFacades.delete(ref.id)
+				}
 			}
 		}
-		this.remoteProxyRecords.add(record)
+		this.activeRemoteProxyRecords.add(record)
 		registerRemoteProxy(remoteFunction, record)
+		if (this.remoteProxyFacades && this.refRegistry) {
+			this.remoteProxyFacades.set(ref.id, new WeakRef(remoteFunction))
+			this.refRegistry.register(remoteFunction, ref.id, remoteFunction)
+		}
 		return remoteFunction
 	}
 
 	/** Create a path-building object proxy for remote property get/set/method calls. */
 	private createRemoteObject(ref: RemoteRefEnvelope): object {
+		const existing = this.remoteProxyFacades?.get(ref.id)?.deref()
+		if (existing && typeof existing === "object") {
+			if (ref.p && ref.p.length > 0) return getPath(existing, ref.p) as object
+			return existing
+		}
+
 		const releaseState = { released: false }
 		const request = (
 			action: "get" | "set" | "call",
@@ -709,17 +767,35 @@ export class RemoteReferenceRPCChannel<
 					return releaseState.released
 				},
 				release: async () => {
-					await this.request("ref", [ref.id, "release"])
-				},
-				markReleased() {
+					if (releaseState.released) return
 					releaseState.released = true
+					this.activeRemoteProxyRecords.delete(record)
+					this.refRegistry.unregister(rootObject)
+					if (this.remoteProxyFacades?.get(ref.id)?.deref() === rootObject) {
+						this.remoteProxyFacades.delete(ref.id)
+					}
+					await this.request("ref", [ref.id, "release"]).catch(() => {})
+				},
+				markReleased: () => {
+					if (releaseState.released) return
+					releaseState.released = true
+					this.activeRemoteProxyRecords.delete(record)
+					this.refRegistry.unregister(rootObject)
+					if (this.remoteProxyFacades?.get(ref.id)?.deref() === rootObject) {
+						this.remoteProxyFacades.delete(ref.id)
+					}
 				}
 			}
-			this.remoteProxyRecords.add(record)
+			this.activeRemoteProxyRecords.add(record)
 			registerRemoteProxy(remoteObject, record)
 			return remoteObject
 		}
-		return createNode(ref.p ?? [])
+		const rootObject = createNode(ref.p ?? [])
+		if (this.remoteProxyFacades && this.refRegistry && (!ref.p || ref.p.length === 0)) {
+			this.remoteProxyFacades.set(ref.id, new WeakRef(rootObject))
+			this.refRegistry.register(rootObject, ref.id, rootObject)
+		}
+		return rootObject
 	}
 
 	/** Execute apply/get/set/call/release against a local reference owned by this channel. */
@@ -764,7 +840,6 @@ export class RemoteReferenceRPCChannel<
 			}
 			return await Reflect.apply(value, ref.receiver, this.decodeArgs(message.a ?? []))
 		}
-		if (ref.kind !== "object") throw new Error(`Remote reference ${refId} is not an object`)
 		if ((typeof value !== "object" && typeof value !== "function") || value === null) {
 			throw new Error(`Remote reference ${refId} is not an object`)
 		}
